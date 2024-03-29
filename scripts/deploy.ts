@@ -1,12 +1,19 @@
 import fs from "fs";
 import { ethers } from "hardhat";
 
+ethers.provider.on('debug', (info) => {
+  console.log(info.action);
+  console.log(info.request);
+  console.log(info.response);
+  // console.log(info.provider);
+});
+
 async function main() {
   let erc20ABI = await ethers.getContractFactory("MockToken");
   let token = await erc20ABI.deploy();
 
   let flowABI = await ethers.getContractFactory("Flow");
-  const blocksPerEpoch = 100;
+  const blocksPerEpoch = 1000000;
   let flow = await flowABI.deploy("0x0000000000000000000000000000000000000000", blocksPerEpoch, 0);
 
   await token.approve(flow.address, 1e9);
