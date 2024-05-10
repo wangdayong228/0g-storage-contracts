@@ -4,14 +4,12 @@ pragma solidity >=0.8.0 <0.9.0;
 import "../miner/Mine.sol";
 
 contract PoraMineTest is PoraMine {
-    constructor(
-        address flow,
-        address cashier,
-        uint256 settings
-    ) PoraMine(flow, cashier, settings) {}
+    constructor(address book, uint256 settings)
+        PoraMine(book, 1, 1, settings | 0x4)
+    {}
 
     function setMiner(bytes32 minerId) external {
-        minerIds[msg.sender] = minerId;
+        beneficiaries[minerId] = msg.sender;
     }
 
     function setQuality(uint256 _targetQuality) external {

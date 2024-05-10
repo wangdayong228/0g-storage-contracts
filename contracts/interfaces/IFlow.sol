@@ -43,6 +43,7 @@ interface IFlow {
 
     function batchSubmit(Submission[] memory submissions)
         external
+        payable
         returns (
             uint256[] memory indexes,
             bytes32[] memory digests,
@@ -52,6 +53,7 @@ interface IFlow {
 
     function submit(Submission memory submission)
         external
+        payable
         returns (
             uint256,
             bytes32,
@@ -60,6 +62,8 @@ interface IFlow {
         );
 
     function makeContext() external;
+
+    function makeContextWithResult() external returns (MineContext memory);
 
     function getContext() external view returns (MineContext memory);
 

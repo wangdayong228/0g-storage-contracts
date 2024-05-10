@@ -8,9 +8,13 @@ import "../utils/IDigestHistory.sol";
 import "../utils/DigestHistory.sol";
 import "../utils/BitMask.sol";
 import "../utils/ZgsSpec.sol";
-import "../dataFlow/IFlow.sol";
 import "../utils/Blake2b.sol";
-import "../uploadMarket/ICashier.sol";
+import "../interfaces/IMarket.sol";
+import "../interfaces/IFlow.sol";
+import "../interfaces/AddressBook.sol";
+
+import "./RecallRange.sol";
+import "./MineLib.sol";
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -18,57 +22,62 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "hardhat/console.sol";
 
 contract PoraMine {
+    using RecallRangeLib for RecallRange;
+
     bytes32 private constant EMPTY_HASH =
         hex"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
 
-    uint256 private constant DIFFICULTY_ADJUST_PERIOD = 100;
-    uint256 private constant TARGET_PERIOD = 100;
+    uint256 private constant DIFFICULTY_ADJUST_RATIO = 20;
+    uint256 private constant TARGET_MINE_BLOCK = 100;
 
     // Settings bit
     uint256 private constant NO_DATA_SEAL = 0x1;
     uint256 private constant NO_DATA_PROOF = 0x2;
-    uint256 private constant NO_MARKET = 0x4;
+    uint256 private constant FIXED_QUALITY = 0x4;
 
     // Options for ZeroGStorage-mine development
     bool public immutable sealDataEnabled;
     bool public immutable dataProofEnabled;
-    bool public immutable marketEnabled;
+    bool public immutable fixedQuality;
 
-    IFlow public immutable flow;
-    ICashier public immutable cashier;
+    uint256 public adjustRatio;
+
+    AddressBook public immutable book;
 
     uint256 public lastMinedEpoch = 0;
     uint256 public targetQuality;
-    mapping(address => bytes32) public minerIds;
+    mapping(bytes32 => address) public beneficiaries;
 
-    uint256 public totalMiningTime;
-    uint256 public totalSubmission;
+    event NewMinerId(bytes32 indexed minerId, address indexed beneficiary);
+    event UpdateMinerId(
+        bytes32 indexed minerId,
+        address indexed from,
+        address indexed to
+    );
 
     constructor(
-        address flow_,
-        address cashier_,
+        address book_,
+        uint256 initRate,
+        uint256 adjustRatio_,
         uint256 settings
     ) {
-        targetQuality = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
+        targetQuality = type(uint256).max / initRate / 300;
+        adjustRatio = adjustRatio_;
         sealDataEnabled = (settings & NO_DATA_SEAL == 0);
         dataProofEnabled = (settings & NO_DATA_PROOF == 0);
-        marketEnabled = (settings & NO_MARKET == 0);
+        fixedQuality = (settings & FIXED_QUALITY != 0);
+        if (fixedQuality) {
+            targetQuality = type(uint256).max;
+        }
 
-        require(
-            cashier_ != address(0) || !marketEnabled,
-            "Cashier does not inited correctly"
-        );
-
-        flow = IFlow(flow_);
-        cashier = ICashier(cashier_);
+        book = AddressBook(book_);
     }
 
     struct PoraAnswer {
         bytes32 contextDigest;
         bytes32 nonce;
         bytes32 minerId;
-        uint256 startPosition;
-        uint256 mineLength;
+        RecallRange range;
         uint256 recallPosition;
         uint256 sealOffset;
         bytes32 sealedContextDigest;
@@ -77,20 +86,17 @@ contract PoraMine {
     }
 
     function submit(PoraAnswer memory answer) public {
-        flow.makeContext();
-        MineContext memory context = flow.getContext();
-        require(
-            context.digest == answer.contextDigest,
-            "Inconsistent mining digest"
-        );
-        require(context.digest != EMPTY_HASH, "Empty digest can not mine");
-        require(context.epoch > lastMinedEpoch, "Epoch has been mined");
-        lastMinedEpoch = context.epoch;
+        // Step 1: check miner ID
+        require(answer.minerId != bytes32(0), "MinerId cannot be zero");
+        address beneficiary = beneficiaries[answer.minerId];
+        require(beneficiary != address(0), "MinerId does not registered");
 
-        // Step 1: basic check for submission
+        MineContext memory context = book.flow().makeContextWithResult();
+
+        // Step 2: basic check for submission
         basicCheck(answer, context);
 
-        // Step 2: check merkle root
+        // Step 3: check merkle root
         bytes32[UNITS_PER_SEAL] memory unsealedData;
         if (sealDataEnabled) {
             unsealedData = unseal(answer);
@@ -103,157 +109,88 @@ contract PoraMine {
         }
         delete unsealedData;
 
-        // Step 3: compute PoRA quality
+        // Step 4: compute PoRA quality
         bytes32 quality = pora(answer);
         require(
-            uint256(quality) <= targetQuality,
+            uint256(quality) <= targetQuality / answer.range.numShards(),
             "Do not reach target quality"
         );
 
-        // TODO: Step 4: adjust quality
-        // _adjustQuality(context);
-
-        // Step 5: reward fee
-        if (marketEnabled) {
-            cashier.claimMineReward(
-                answer.recallPosition / SECTORS_PER_PRICE,
-                msg.sender
-            );
+        // Step 5: adjust quality
+        if (!fixedQuality) {
+            _adjustQuality(context);
         }
+
+        // Step 6: reward fee
+        book.reward().claimMineReward(
+            answer.recallPosition / SECTORS_PER_PRICE,
+            payable(beneficiary),
+            answer.minerId
+        );
+
+        // Step 7: finish
+        lastMinedEpoch = context.epoch;
     }
 
     function basicCheck(PoraAnswer memory answer, MineContext memory context)
         public
         view
     {
+        // Check basic field
+        require(
+            context.digest == answer.contextDigest,
+            "Inconsistent mining digest"
+        );
+        require(context.digest != EMPTY_HASH, "Empty digest can not mine");
+        require(context.epoch > lastMinedEpoch, "Epoch has been mined");
+
+        // Check validity of recall range
         uint256 maxLength = (context.flowLength / SECTORS_PER_LOAD) *
             SECTORS_PER_LOAD;
+        answer.range.check(maxLength);
 
-        require(
-            answer.startPosition + answer.mineLength <= maxLength,
-            "Mining range overflow"
-        );
-        require(
-            answer.mineLength <= MAX_MINING_LENGTH,
-            "Mining range too long"
-        );
-
-        require(
-            answer.startPosition % SECTORS_PER_PRICE == 0,
-            "Start position is not aligned"
-        );
-
-        uint256 requiredLength = Math.min(maxLength, MAX_MINING_LENGTH);
-
-        require(answer.mineLength >= requiredLength, "Mining range too short");
-
-        EpochRange memory range = flow.getEpochRange(
+        // Check the sealing context is in the correct range.
+        EpochRange memory epochRange = book.flow().getEpochRange(
             answer.sealedContextDigest
         );
         uint256 recallEndPosition = answer.recallPosition + SECTORS_PER_SEAL;
         require(
-            range.start < recallEndPosition && range.end >= recallEndPosition,
+            epochRange.start < recallEndPosition &&
+                epochRange.end >= recallEndPosition,
             "Invalid sealed context digest"
         );
     }
 
     function pora(PoraAnswer memory answer) public view returns (bytes32) {
-        bytes32 minerId = minerIds[msg.sender];
-        require(answer.minerId != bytes32(0x0), "Miner ID does not exist");
-        require(answer.minerId == minerId, "Miner ID is inconsistent");
+        require(answer.minerId != bytes32(0x0), "Miner ID cannot be empty");
 
-        bytes32[5] memory seedInput = [
-            minerId,
+        bytes32[4] memory seedInput = [
+            answer.minerId,
             answer.nonce,
             answer.contextDigest,
-            bytes32(answer.startPosition),
-            bytes32(answer.mineLength)
+            answer.range.digest()
         ];
 
-        bytes32[2] memory blake2bHash = Blake2b.blake2b(seedInput);
+        bytes32[2] memory padSeed = Blake2b.blake2b(seedInput);
 
         uint256 scratchPadOffset = answer.sealOffset % SEALS_PER_PAD;
-        bytes32[UNITS_PER_SEAL] memory scratchPad;
-
-        for (uint256 i = 0; i < scratchPadOffset; i += 1) {
-            for (uint256 j = 0; j < BHASHES_PER_SEAL; j += 1) {
-                blake2bHash = Blake2b.blake2b(blake2bHash);
-            }
-        }
-
-        for (uint256 i = 0; i < UNITS_PER_SEAL; i += 2) {
-            blake2bHash = Blake2b.blake2b(blake2bHash);
-            scratchPad[i] = blake2bHash[0] ^ answer.sealedData[i];
-            scratchPad[i + 1] = blake2bHash[1] ^ answer.sealedData[i + 1];
-        }
-
-        for (uint256 i = scratchPadOffset + 1; i < SEALS_PER_PAD; i += 1) {
-            for (uint256 j = 0; j < BHASHES_PER_SEAL; j += 1) {
-                blake2bHash = Blake2b.blake2b(blake2bHash);
-            }
-        }
-
-        uint256 chunkOffset = uint256(keccak256(abi.encode(blake2bHash))) %
-            (answer.mineLength / SECTORS_PER_LOAD);
+        bytes32[UNITS_PER_SEAL] memory mixedData;
+        bytes32[2] memory padDigest;
+        (padDigest, mixedData) = MineLib.computeScratchPadAndMix(
+            answer.sealedData,
+            scratchPadOffset,
+            padSeed
+        );
 
         require(
             answer.recallPosition ==
-                answer.startPosition +
-                    chunkOffset *
-                    SECTORS_PER_LOAD +
+                answer.range.recallChunk(keccak256(abi.encode(padDigest))) +
                     answer.sealOffset *
                     SECTORS_PER_SEAL,
             "Incorrect recall position"
         );
 
-        bytes32[2] memory h;
-        h[0] = Blake2b.BLAKE2B_INIT_STATE0;
-        h[1] = Blake2b.BLAKE2B_INIT_STATE1;
-
-        h = Blake2b.blake2bF(
-            h,
-            bytes32(answer.sealOffset),
-            minerId,
-            answer.nonce,
-            answer.contextDigest,
-            128,
-            false
-        );
-        h = Blake2b.blake2bF(
-            h,
-            bytes32(answer.startPosition),
-            bytes32(answer.mineLength),
-            bytes32(0),
-            bytes32(0),
-            256,
-            false
-        );
-        for (uint256 i = 0; i < UNITS_PER_SEAL - 4; i += 4) {
-            uint256 length;
-            unchecked {
-                length = 256 + 32 * (i + 4);
-            }
-            h = Blake2b.blake2bF(
-                h,
-                scratchPad[i],
-                scratchPad[i + 1],
-                scratchPad[i + 2],
-                scratchPad[i + 3],
-                length,
-                false
-            );
-        }
-        h = Blake2b.blake2bF(
-            h,
-            scratchPad[UNITS_PER_SEAL - 4],
-            scratchPad[UNITS_PER_SEAL - 3],
-            scratchPad[UNITS_PER_SEAL - 2],
-            scratchPad[UNITS_PER_SEAL - 1],
-            256 + UNITS_PER_SEAL * 32,
-            true
-        );
-        delete scratchPad;
-        return h[0];
+        return MineLib.computePoraHash(answer.sealOffset, padSeed, mixedData);
     }
 
     function unseal(PoraAnswer memory answer)
@@ -332,27 +269,51 @@ contract PoraMine {
         return currentHash;
     }
 
+    function requestMinerId(address beneficiary, uint64 seed) public {
+        bytes32 minerId = keccak256(
+            abi.encodePacked(blockhash(block.number - 1), msg.sender, seed)
+        );
+        require(beneficiaries[minerId] == address(0), "MinerId has registered");
+        beneficiaries[minerId] = beneficiary;
+        emit NewMinerId(minerId, beneficiary);
+    }
+
+    function transferBeneficial(address to, bytes32 minerId) public {
+        require(
+            beneficiaries[minerId] == msg.sender,
+            "Sender does not own minerId"
+        );
+        beneficiaries[minerId] = to;
+        emit UpdateMinerId(minerId, msg.sender, to);
+    }
+
     function _adjustQuality(MineContext memory context) internal {
-        uint256 miningTime = block.number - context.mineStart;
-        totalMiningTime += miningTime;
-        totalSubmission += 1;
-        if (totalSubmission == DIFFICULTY_ADJUST_PERIOD) {
-            uint256 targetMiningTime = TARGET_PERIOD * totalSubmission;
-            (bool overflow, uint256 multiply) = SafeMath.tryMul(
-                targetQuality,
-                totalMiningTime
-            );
-            if (overflow) {
-                targetQuality = Math.mulDiv(
-                    targetQuality,
-                    totalMiningTime,
-                    targetMiningTime
-                );
-            } else {
-                targetQuality = multiply / targetMiningTime;
-            }
-            totalMiningTime = 0;
-            totalSubmission = 0;
+        uint256 miningBlocks = block.number - context.mineStart;
+
+        // Remove least significant 16 bits to avoid overflow
+        uint256 scaledTarget = targetQuality >> 16;
+        uint256 scaledExpected = Math.mulDiv(
+            scaledTarget,
+            miningBlocks,
+            TARGET_MINE_BLOCK
+        );
+
+        uint256 n = DIFFICULTY_ADJUST_RATIO;
+
+        uint256 scaledAdjusted = (scaledTarget * (n - 1) + scaledExpected) / n;
+
+        if (scaledAdjusted > scaledTarget * 2) {
+            scaledAdjusted = scaledTarget * 2;
         }
+
+        if (scaledAdjusted < scaledTarget / 2) {
+            scaledAdjusted = scaledTarget / 2;
+        }
+
+        if (scaledAdjusted > type(uint256).max >> 16) {
+            scaledAdjusted = type(uint256).max >> 16;
+        }
+
+        targetQuality = scaledAdjusted << 16;
     }
 }

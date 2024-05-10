@@ -42,6 +42,24 @@ const config: HardhatUserConfig = {
       accounts: [
         "7c5da44cf462b81e0b61a582f8c9b23ca78fc23e7104138f4e4329a9b2076e23",//0x26154DF6A79a6C241b46545D672A3Ba6AE8813bE
       ]
+    },
+    bsc: {
+      url: "https://bsc-testnet.publicnode.com",
+      accounts: [
+        "36b9e861b63d3509c88b7817275a30d22d62c8cd8fa6486ddee35ef0d8e0495f",
+      ],
+    },
+    conflux: {
+      url: "http://evmtestnet.confluxrpc.com",
+      accounts: [
+        "36b9e861b63d3509c88b7817275a30d22d62c8cd8fa6486ddee35ef0d8e0495f",
+      ],
+    },
+    zg: {
+      url: "https://rpc-testnet.0g.ai",
+      accounts: [
+        "36b9e861b63d3509c88b7817275a30d22d62c8cd8fa6486ddee35ef0d8e0495f",
+      ],
     }
   },
   gasReporter: {

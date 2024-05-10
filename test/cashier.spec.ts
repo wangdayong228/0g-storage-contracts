@@ -1,10 +1,11 @@
 import { assert, expect } from "chai";
 import { ethers } from "hardhat";
 import { MockContract } from "ethereum-waffle";
-import { deployMock } from "./utils/deploy";
-import { CashierTest } from "../typechain-types";
+import { deployAddressBook, deployMock, transferBalance } from "./utils/deploy";
+import { CashierTest, ChunkDecayReward } from "../typechain-types";
 import { increaseTime, Snapshot } from "./utils/snapshot";
 import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
+import { predictContractAddress } from "../scripts/addressPredict";
 
 const KB: number = 1024;
 const MB: number = 1024 * KB;
@@ -14,11 +15,13 @@ const BYTES_PER_SECTOR = 256;
 const BASIC_PRICE = 1000;
 const UPLOAD_TOKEN_PER_SECTOR: bigint = BigInt(10) ** BigInt(18);
 
-describe.only("Cashier", async function () {
+describe("Cashier", async function () {
   let mockCoupon: MockContract;
   let mockUploadToken: MockContract;
   let mockZgsToken: MockContract;
+
   let cashier: CashierTest;
+  let rewardContract: ChunkDecayReward;
   let snapshot: Snapshot;
   let owner: SignerWithAddress;
   let mockMine: SignerWithAddress;
@@ -30,15 +33,26 @@ describe.only("Cashier", async function () {
 
     mockCoupon = await deployMock(owner, "Coupon");
     mockUploadToken = await deployMock(owner, "UploadToken");
-    mockZgsToken = await deployMock(owner, "MockToken");
+    mockZgsToken = await deployMock(owner, "MockHackToken");
 
+    await mockZgsToken.mock.receiveNative.returns()
+    await mockZgsToken.receiveNative({value: ethers.utils.parseEther("1000")})
+
+    const rewardAddress = await predictContractAddress(owner, 1);
+    const marketAddress = await predictContractAddress(owner, 2);
+
+    let book = await deployAddressBook({flow: mockFlow.address, mine: mockMine.address, reward: rewardAddress, market: marketAddress})
+
+    let rewardABI = await ethers.getContractFactory("ChunkDecayReward");
+    rewardContract = await rewardABI.deploy(book.address, 40);
+  
     let cashierABI = await ethers.getContractFactory("CashierTest");
     cashier = await cashierABI.deploy(
-      mockZgsToken.address,
+      book.address,
       mockUploadToken.address,
-      mockFlow.address,
-      mockMine.address,
-      mockStake.address
+      mockStake.address,
+      mockZgsToken.address,
+      {value: ethers.utils.parseEther("1000")}
     );
 
     snapshot = await new Snapshot().snapshot();
@@ -53,7 +67,7 @@ describe.only("Cashier", async function () {
       await cashier.updateTotalSubmission((3 * TB) / BYTES_PER_SECTOR);
       let beforeGauge = (await cashier.gauge()).toBigInt();
       await increaseTime(100);
-      await cashier.updateGauge();
+      await cashier.refreshGauge();
       let afterGauge = (await cashier.gauge()).toBigInt();
       assert(
         afterGauge - beforeGauge == BigInt(300 * MB),
@@ -64,7 +78,7 @@ describe.only("Cashier", async function () {
     it("Upper bound capped", async () => {
       await cashier.updateTotalSubmission((3 * TB) / BYTES_PER_SECTOR);
       await increaseTime(20000);
-      await cashier.updateGauge();
+      await cashier.refreshGauge();
       let afterGauge = (await cashier.gauge()).toBigInt();
       assert(afterGauge == BigInt(30 * GB));
     });
@@ -73,7 +87,7 @@ describe.only("Cashier", async function () {
       await cashier.updateTotalSubmission((1 * TB) / BYTES_PER_SECTOR - 1);
       let beforeGauge = (await cashier.gauge()).toBigInt();
       await increaseTime(100);
-      await cashier.updateGauge();
+      await cashier.refreshGauge();
       let afterGauge = (await cashier.gauge()).toBigInt();
       assert(
         afterGauge - beforeGauge == BigInt(100 * MB),
@@ -87,7 +101,7 @@ describe.only("Cashier", async function () {
       await increaseTime(100);
       await cashier.updateTotalSubmission((1 * TB) / BYTES_PER_SECTOR);
       await increaseTime(100);
-      await cashier.updateGauge();
+      await cashier.refreshGauge();
       let afterGauge = (await cashier.gauge()).toBigInt();
       assert(
         afterGauge - beforeGauge == BigInt(300 * MB),
@@ -103,7 +117,7 @@ describe.only("Cashier", async function () {
       await increaseTime(100);
       await cashier.purchase((50 * MB) / BYTES_PER_SECTOR, BASIC_PRICE, 0);
       await increaseTime(100);
-      await cashier.updateGauge();
+      await cashier.refreshGauge();
       let afterGauge = (await cashier.gauge()).toBigInt();
       assert(
         afterGauge - beforeGauge == BigInt(550 * MB),
@@ -411,7 +425,7 @@ describe.only("Cashier", async function () {
     });
 
     it("Permission test", async () => {
-      await expect(cashier.chargeFee(7, 8)).to.be.revertedWith(
+      await expect(cashier.chargeFeeTest(7, 8)).to.be.revertedWith(
         "Sender does not have permission"
       );
     });
@@ -419,7 +433,7 @@ describe.only("Cashier", async function () {
     it("Update dripping rate", async () => {
       const SECTORS = 1024 * 1024;
       await topup(SECTORS);
-      await cashierInternal.chargeFee(SECTORS, SECTORS - 1);
+      await cashierInternal.chargeFeeTest(SECTORS, SECTORS - 1);
       expect(await cashier.drippingRate()).to.equal(
         (2 * SECTORS * BYTES_PER_SECTOR) / MB
       );
@@ -427,14 +441,14 @@ describe.only("Cashier", async function () {
 
     it("Not paid", async () => {
       await topup(4);
-      await expect(cashierInternal.chargeFee(8, 7)).to.be.revertedWith(
+      await expect(cashierInternal.chargeFeeTest(8, 7)).to.be.revertedWith(
         "Data submission is not paid"
       );
     });
 
     it("Charge partial", async () => {
       await topup(16);
-      await cashierInternal.chargeFee(8, 7);
+      await cashierInternal.chargeFeeTest(8, 7);
       expect(await cashier.paidFee()).equal(8 * BYTES_PER_SECTOR * BASIC_PRICE);
       expect(await cashier.paidUploadAmount()).equal(8);
     });
@@ -443,41 +457,41 @@ describe.only("Cashier", async function () {
       await cashier.updateTotalSubmission((2 * GB) / BYTES_PER_SECTOR - 1);
       await topup((8 * GB) / BYTES_PER_SECTOR);
       {
-        await cashierInternal.chargeFee((2 * GB) / BYTES_PER_SECTOR, 0);
-        const reward = await cashier.rewards(0);
+        await cashierInternal.chargeFeeTest((2 * GB) / BYTES_PER_SECTOR, 0);
+        const reward = await rewardContract.rewards(0);
         assert(reward.claimableReward.toNumber() == 0);
         assert(
           reward.lockedReward.toBigInt() == BigInt(2 * GB) * BigInt(BASIC_PRICE)
         );
-        assert(reward.timestamp == 0);
+        assert(reward.startTime == 0);
 
-        const rewardNext = await cashier.rewards(1);
+        const rewardNext = await rewardContract.rewards(1);
         assert(rewardNext.lockedReward.toNumber() == 0);
       }
 
       {
-        await cashierInternal.chargeFee((4 * GB) / BYTES_PER_SECTOR, 0);
-        const reward = await cashier.rewards(0);
+        await cashierInternal.chargeFeeTest((4 * GB) / BYTES_PER_SECTOR, 0);
+        const reward = await rewardContract.rewards(0);
         assert(reward.claimableReward.toNumber() == 0);
         assert(
           reward.lockedReward.toBigInt() == BigInt(6 * GB) * BigInt(BASIC_PRICE)
         );
-        assert(reward.timestamp > 0);
+        assert(reward.startTime > 0);
 
-        const rewardNext = await cashier.rewards(1);
+        const rewardNext = await rewardContract.rewards(1);
         assert(rewardNext.lockedReward.toNumber() == 0);
       }
 
       {
-        await cashierInternal.chargeFee((2 * GB) / BYTES_PER_SECTOR, 0);
-        const reward = await cashier.rewards(1);
+        await cashierInternal.chargeFeeTest((2 * GB) / BYTES_PER_SECTOR, 0);
+        const reward = await rewardContract.rewards(1);
         assert(reward.claimableReward.toNumber() == 0);
         assert(
           reward.lockedReward.toBigInt() == BigInt(2 * GB) * BigInt(BASIC_PRICE)
         );
-        assert(reward.timestamp == 0);
+        assert(reward.startTime == 0);
 
-        const rewardNext = await cashier.rewards(2);
+        const rewardNext = await rewardContract.rewards(2);
         assert(rewardNext.lockedReward.toNumber() == 0);
       }
     });
@@ -486,32 +500,32 @@ describe.only("Cashier", async function () {
       await cashier.updateTotalSubmission((2 * GB) / BYTES_PER_SECTOR - 1);
       await topup((16 * GB) / BYTES_PER_SECTOR);
       {
-        await cashierInternal.chargeFee((16 * GB) / BYTES_PER_SECTOR, 0);
-        const reward0 = await cashier.rewards(0);
+        await cashierInternal.chargeFeeTest((16 * GB) / BYTES_PER_SECTOR, 0);
+        const reward0 = await rewardContract.rewards(0);
         assert(reward0.claimableReward.toNumber() == 0);
         assert(
           reward0.lockedReward.toBigInt() ==
             BigInt(6 * GB) * BigInt(BASIC_PRICE)
         );
-        assert(reward0.timestamp > 0);
+        assert(reward0.startTime > 0);
 
-        const reward1 = await cashier.rewards(1);
+        const reward1 = await rewardContract.rewards(1);
         assert(reward1.claimableReward.toNumber() == 0);
         assert(
           reward1.lockedReward.toBigInt() ==
             BigInt(8 * GB) * BigInt(BASIC_PRICE)
         );
-        assert(reward1.timestamp > 0);
+        assert(reward1.startTime > 0);
 
-        const reward2 = await cashier.rewards(2);
+        const reward2 = await rewardContract.rewards(2);
         assert(reward2.claimableReward.toNumber() == 0);
         assert(
           reward2.lockedReward.toBigInt() ==
             BigInt(2 * GB) * BigInt(BASIC_PRICE)
         );
-        assert(reward2.timestamp == 0);
+        assert(reward2.startTime == 0);
 
-        const rewardNext = await cashier.rewards(3);
+        const rewardNext = await rewardContract.rewards(3);
         assert(rewardNext.lockedReward.toNumber() == 0);
       }
     });
@@ -524,11 +538,11 @@ describe.only("Cashier", async function () {
         if (finalized) {
           await cashier
             .connect(mockFlow)
-            .chargeFee((6 * GB) / BYTES_PER_SECTOR, 0);
+            .chargeFeeTest((6 * GB) / BYTES_PER_SECTOR, 0);
         } else {
           await cashier
             .connect(mockFlow)
-            .chargeFee((5 * GB) / BYTES_PER_SECTOR, 0);
+            .chargeFeeTest((5 * GB) / BYTES_PER_SECTOR, 0);
         }
       }
       let cashierInternal: CashierTest;
@@ -537,8 +551,9 @@ describe.only("Cashier", async function () {
       });
 
       it("Permission test", async () => {
+        const minerId = Buffer.from("0000000000000000000000000000000000000000000000000000000000000001", "hex")
         await expect(
-          cashier.claimMineReward(0, owner.address)
+          rewardContract.claimMineReward(0, owner.address, minerId)
         ).to.be.revertedWith("Sender does not have permission");
       });
     });

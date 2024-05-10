@@ -1,5 +1,5 @@
 {
-  "name": "zerog-storage-contracts",
+  "name": "0g-storage-contracts",
   "author": "Zero Gravity Labs",
   "version": "0.0.1",
   "license": "Unlicense",
@@ -12,7 +12,7 @@
     "lint": "npm run prettier && npm run solhint",
     "lint:check": "npm run prettier:check && npm run solhint:check",
     "compile": "hardhat compile",
-    "test": "NODE_ENV=test find test -name '*.spec.ts' -print0 | xargs -0 -I {} hardhat test {}",
+    "test": "hardhat test",
     "deploy:localtest": "hardhat run scripts/deploy.ts --network localtest",
     "localtest": "yarn compile && yarn deploy:localtest"
   },
