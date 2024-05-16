@@ -79,6 +79,14 @@ async function deployNoMarket() {
 
   console.log(output);
   writeDeployResult(output);
+
+  return {
+    flow: flow.address,
+    mine: mine.address,
+    book: book.address,
+    blockNumber: blockNumber,
+    account: account,
+  }
 }
 
 async function main() {
@@ -89,9 +97,13 @@ async function main() {
   }
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((error) => {
-    console.error(error);
-    process.exit(1);
-  });
+// main()
+//   .then(() => process.exit(0))
+//   .catch((error) => {
+//     console.error(error);
+//     process.exit(1);
+//   });
+
+export {
+  deployNoMarket
+}
